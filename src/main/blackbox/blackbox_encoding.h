@@ -17,8 +17,15 @@
 
 #pragma once
 
+#include <stdbool.h>
+
 int blackboxPrintf(const char *fmt, ...);
-void blackboxPrintfHeaderLine(const char *name, const char *fmt, ...);
+/* Returns true when the whole line has been written; on false the caller must not
+ * advance its state machine and should call again next iteration. */
+bool blackboxPrintfHeaderLine(const char *name, const char *fmt, ...);
+/* Same contract, but writes the text verbatim and leaves blackboxHeaderBudget to
+ * the caller. For header lines assembled from several pieces. */
+bool blackboxPrintfResumable(const char *fmt, ...);
 int blackboxPrint(const char *s);
 
 void blackboxWriteUnsignedVB(uint32_t value);

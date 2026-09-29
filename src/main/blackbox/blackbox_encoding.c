@@ -29,6 +29,11 @@
 #include "common/encoding.h"
 #include "common/printf.h"
 
+/* Longest header line this writer emits. "Firmware revision" is the longest as of
+ * writing; 128 leaves generous room. Field-name lines are far longer but go out
+ * through blackboxWriteFieldHeader(), not this function. */
+#define BLACKBOX_HEADER_LINE_MAX 128
+
 
 static void _putc(void *p, char c)
 {
@@ -60,24 +65,125 @@ int blackboxPrintf(const char *fmt, ...)
  * printf a Blackbox header line with a leading "H " and trailing "\n" added automatically. blackboxHeaderBudget is
  * decreased to account for the number of bytes written.
  */
-void blackboxPrintfHeaderLine(const char *name, const char *fmt, ...)
+/* A putf() sink that appends to a fixed buffer and silently discards anything
+ * past the end, so rendering can never overrun lineBuf. */
+typedef struct blackboxLineSink_s {
+    char *buf;
+    uint16_t len;
+    uint16_t cap;
+} blackboxLineSink_t;
+
+static void blackboxLinePutc(void *p, char c)
 {
-    va_list va;
+    blackboxLineSink_t *sink = (blackboxLineSink_t *)p;
+    if (sink->len < sink->cap) {
+        sink->buf[sink->len++] = c;
+    }
+}
 
-    blackboxWrite('H');
-    blackboxWrite(' ');
-    blackboxPrint(name);
-    blackboxWrite(':');
+/*
+ * Render the line into a buffer and write it with blackboxWriteChunk(), resuming
+ * from wherever the previous attempt stopped.
+ *
+ * Previously each byte went out through blackboxWrite(), which cannot report
+ * failure: on SD it calls afatfs_fputc(), which drops the byte silently whenever
+ * the filesystem is busy -- and the filesystem is busiest exactly while the log
+ * file is being created and extended, which is when headers are written. The
+ * caller had already advanced xmitState by then, so dropped bytes were never
+ * re-sent and the header lost runs of bytes mid-line.
+ *
+ * Returns true when the whole line has been written. On false the caller must
+ * NOT advance its state machine; call again next iteration and the remainder of
+ * the same line is sent. The file cursor only advances by what was accepted, so
+ * resuming at the offset reproduces the line exactly.
+ */
+/* Shared by both resumable writers. Sharing one buffer is safe because no caller
+ * advances its state machine while a line is incomplete, so two partial lines can
+ * never be in flight at once. */
+static char resumeBuf[BLACKBOX_HEADER_LINE_MAX];
+static uint16_t resumeLen = 0;
+static uint16_t resumeSent = 0;
 
-    va_start(va, fmt);
+/* Push whatever the device will take. Returns true once the buffer is drained,
+ * reporting through *outLen how many bytes the completed line occupied. */
+static bool blackboxResumableFlush(uint16_t *outLen)
+{
+    resumeSent += blackboxWriteChunk((const uint8_t *)resumeBuf + resumeSent, resumeLen - resumeSent);
 
-    const int written = blackboxPrintfv(fmt, va);
+    if (resumeSent < resumeLen) {
+        return false;
+    }
 
-    va_end(va);
+    *outLen = resumeLen;
+    resumeLen = 0;
+    return true;
+}
 
-    blackboxWrite('\n');
+bool blackboxPrintfHeaderLine(const char *name, const char *fmt, ...)
+{
+    if (resumeLen == 0) {
+        // Note tfp_snprintf() cannot be used to render this: its size argument is
+        // not honoured (printf.c computes its end pointer from the address of its
+        // own local pointer, not from the caller's buffer), so it would overrun.
+        // Render through tfp_format() with a sink that bounds itself. One byte is
+        // held back for the trailing newline.
+        blackboxLineSink_t sink = { .buf = resumeBuf, .len = 0, .cap = sizeof(resumeBuf) - 1 };
 
-    blackboxHeaderBudget -= written + 3;
+        blackboxLinePutc(&sink, 'H');
+        blackboxLinePutc(&sink, ' ');
+        for (const char *p = name; *p != '\0'; p++) {
+            blackboxLinePutc(&sink, *p);
+        }
+        blackboxLinePutc(&sink, ':');
+
+        va_list va;
+        va_start(va, fmt);
+        tfp_format(&sink, blackboxLinePutc, fmt, va);
+        va_end(va);
+
+        // Always fits: cap left one byte spare. An over-long line is truncated
+        // rather than dropped, so the log stays parseable.
+        resumeBuf[sink.len++] = '\n';
+
+        resumeLen = sink.len;
+        resumeSent = 0;
+    }
+
+    uint16_t written;
+    if (!blackboxResumableFlush(&written)) {
+        return false;               // retry the remainder next iteration
+    }
+
+    blackboxHeaderBudget -= written;
+    return true;
+}
+
+/*
+ * As blackboxPrintfHeaderLine(), but writes the formatted text verbatim -- no
+ * "H name:" prefix and no newline -- for callers that build a header line from
+ * several pieces. The caller owns blackboxHeaderBudget.
+ *
+ * Returns true when the whole piece has been written. On false the caller must
+ * not advance its state machine; call again next iteration and the remainder of
+ * the same piece is sent. Arguments are ignored while a piece is pending, so it
+ * is safe (and required) to call again with the same ones.
+ */
+bool blackboxPrintfResumable(const char *fmt, ...)
+{
+    if (resumeLen == 0) {
+        blackboxLineSink_t sink = { .buf = resumeBuf, .len = 0, .cap = sizeof(resumeBuf) };
+
+        va_list va;
+        va_start(va, fmt);
+        tfp_format(&sink, blackboxLinePutc, fmt, va);
+        va_end(va);
+
+        resumeLen = sink.len;
+        resumeSent = 0;
+    }
+
+    uint16_t written;
+    return blackboxResumableFlush(&written);
 }
 
 /**

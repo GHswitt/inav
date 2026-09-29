@@ -102,6 +102,36 @@ void blackboxOpen(void)
 }
 #endif // UNIT_TEST
 
+/**
+ * Write up to `len` bytes, returning how many were actually accepted.
+ *
+ * blackboxWrite() cannot report failure: it is void, and on SD it calls
+ * afatfs_fputc(), which discards the result of afatfs_fwrite() and so drops the
+ * byte silently whenever the filesystem is busy. That is invisible to the header
+ * writer, which has already advanced its state machine by then -- the cause of
+ * headers losing whole runs of bytes mid-line (see BLACKBOX_HEADER_CORRUPTION.md).
+ *
+ * Callers that must not lose data use this instead and resume from the returned
+ * offset. Frame logging keeps using blackboxWrite(): it runs on the fast path
+ * with the sector already cache-locked, where writes cannot fail.
+ */
+uint32_t blackboxWriteChunk(const uint8_t *buffer, uint32_t len)
+{
+    switch (blackboxConfig()->device) {
+#ifdef USE_SDCARD
+    case BLACKBOX_DEVICE_SDCARD:
+        return afatfs_fwrite(blackboxSDCard.logFile, buffer, len);
+#endif
+    default:
+        // Every other backend buffers internally and blackboxWrite() cannot fail
+        // for them in a way we could observe, so report a full write.
+        for (uint32_t i = 0; i < len; i++) {
+            blackboxWrite(buffer[i]);
+        }
+        return len;
+    }
+}
+
 void blackboxWrite(uint8_t value)
 {
     switch (blackboxConfig()->device) {

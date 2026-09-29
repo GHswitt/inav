@@ -1800,7 +1800,12 @@ static bool sendFieldDefinition(char mainFrameChar, char deltaFrameChar, const v
             return true; // Try again later
         }
 
-        blackboxHeaderBudget -= blackboxPrintf("H Field %c %s:", xmitState.headerIndex >= BLACKBOX_SIMPLE_FIELD_HEADER_COUNT ? deltaFrameChar : mainFrameChar, blackboxFieldHeaderNames[xmitState.headerIndex]);
+        // Resumable: on a partial write do not advance fieldIndex, so the same
+        // prefix is continued on the next call rather than being left truncated.
+        if (!blackboxPrintfResumable("H Field %c %s:", xmitState.headerIndex >= BLACKBOX_SIMPLE_FIELD_HEADER_COUNT ? deltaFrameChar : mainFrameChar, blackboxFieldHeaderNames[xmitState.headerIndex])) {
+            return true; // Try again later
+        }
+        blackboxHeaderBudget -= charsToBeWritten;
 
         xmitState.u.fieldIndex++;
         needComma = false;
@@ -1831,33 +1836,43 @@ static bool sendFieldDefinition(char mainFrameChar, char deltaFrameChar, const v
                 return true;
             }
 
-            blackboxHeaderBudget -= bytesToWrite;
-
-            if (needComma) {
-                blackboxWrite(',');
-            } else {
-                needComma = true;
-            }
+            // Render the element -- leading comma included -- as one unit, so a
+            // partial write is retried whole instead of being split or doubled.
+            // needComma and the budget are only updated once it is fully out.
+            const char *comma = needComma ? "," : "";
+            bool complete;
 
             // The first header is a field name
             if (xmitState.headerIndex == 0) {
-                blackboxPrint(def->name);
-
                 // Do we need to print an index in brackets after the name?
                 if (def->fieldNameIndex != -1) {
-                    blackboxPrintf("[%d]", def->fieldNameIndex);
+                    complete = blackboxPrintfResumable("%s%s[%d]", comma, def->name, def->fieldNameIndex);
+                } else {
+                    complete = blackboxPrintfResumable("%s%s", comma, def->name);
                 }
             } else {
                 //The other headers are integers
-                blackboxPrintf("%d", def->arr[xmitState.headerIndex - 1]);
+                complete = blackboxPrintfResumable("%s%d", comma, def->arr[xmitState.headerIndex - 1]);
             }
+
+            if (!complete) {
+                return true; // Try again later, same field
+            }
+
+            blackboxHeaderBudget -= bytesToWrite;
+            needComma = true;
         }
     }
 
     // Did we complete this line?
     if (xmitState.u.fieldIndex == fieldCount && blackboxDeviceReserveBufferSpace(1) == BLACKBOX_RESERVE_SUCCESS) {
+        // Only move to the next line once the newline is actually out. Losing it
+        // fuses this line to the next one, which is the corruption signature that
+        // makes the whole header unparseable.
+        if (!blackboxPrintfResumable("\n")) {
+            return true; // Try again later
+        }
         blackboxHeaderBudget--;
-        blackboxWrite('\n');
         xmitState.headerIndex++;
         xmitState.u.fieldIndex = -1;
     }
@@ -1878,7 +1893,9 @@ static char *blackboxGetStartDateTime(char *buf)
 
 #ifndef BLACKBOX_PRINT_HEADER_LINE
 #define BLACKBOX_PRINT_HEADER_LINE(name, format, ...) case __COUNTER__: \
-                                                blackboxPrintfHeaderLine(name, format, __VA_ARGS__); \
+                                                if (!blackboxPrintfHeaderLine(name, format, __VA_ARGS__)) { \
+                                                    return false; /* retry this line, do not advance */ \
+                                                } \
                                                 break;
 #define BLACKBOX_PRINT_HEADER_LINE_CUSTOM(...) case __COUNTER__: \
                                                     {__VA_ARGS__}; \
@@ -1914,7 +1931,9 @@ static bool blackboxWriteSysinfo(void)
 #ifdef USE_ADC
         BLACKBOX_PRINT_HEADER_LINE_CUSTOM(
             if (testBlackboxCondition(FLIGHT_LOG_FIELD_CONDITION_VBAT)) {
-                blackboxPrintfHeaderLine("vbat_scale", "%u", batteryMetersConfig()->voltage.scale / 10);
+                if (!blackboxPrintfHeaderLine("vbat_scale", "%u", batteryMetersConfig()->voltage.scale / 10)) {
+                    return false;   // partial write: retry this line, do not advance
+                }
             } else {
                 xmitState.headerIndex += 2; // Skip the next two vbat fields too
             }
@@ -1928,8 +1947,10 @@ static bool blackboxWriteSysinfo(void)
         BLACKBOX_PRINT_HEADER_LINE_CUSTOM(
             //Note: Log even if this is a virtual current meter, since the virtual meter uses these parameters too:
             if (feature(FEATURE_CURRENT_METER)) {
-                blackboxPrintfHeaderLine("currentMeter", "%d,%d",           batteryMetersConfig()->current.offset,
-                                                                            batteryMetersConfig()->current.scale);
+                if (!blackboxPrintfHeaderLine("currentMeter", "%d,%d",      batteryMetersConfig()->current.offset,
+                                                                            batteryMetersConfig()->current.scale)) {
+                    return false;   // partial write: retry this line, do not advance
+                }
             }
             );
 
@@ -2196,14 +2217,24 @@ void blackboxUpdate(timeUs_t currentTimeUs)
          */
         if (millis() > xmitState.u.startTime + 100) {
             if (blackboxDeviceReserveBufferSpace(BLACKBOX_TARGET_HEADER_BUDGET_PER_ITERATION) == BLACKBOX_RESERVE_SUCCESS) {
-                for (int i = 0; i < BLACKBOX_TARGET_HEADER_BUDGET_PER_ITERATION && blackboxHeader[xmitState.headerIndex] != '\0'; i++, xmitState.headerIndex++) {
-                    blackboxWrite(blackboxHeader[xmitState.headerIndex]);
-                    blackboxHeaderBudget--;
+                // Advance only by the bytes the device actually accepted. Writing
+                // byte-by-byte with blackboxWrite() and advancing regardless lost
+                // whatever afatfs dropped while busy -- and this is the first write
+                // to a just-created file, when it is busiest.
+                const uint32_t remaining = strlen(blackboxHeader + xmitState.headerIndex);
+                if (remaining > 0) {
+                    const uint32_t toWrite = MIN(remaining, (uint32_t)BLACKBOX_TARGET_HEADER_BUDGET_PER_ITERATION);
+                    const uint32_t written = blackboxWriteChunk((const uint8_t *)blackboxHeader + xmitState.headerIndex, toWrite);
+                    xmitState.headerIndex += written;
+                    blackboxHeaderBudget -= (int32_t)written;
                 }
 
                 if (blackboxHeader[xmitState.headerIndex] == '\0') {
-                    blackboxPrintfHeaderLine("I interval", "%d", blackboxIFrameInterval);
-                    blackboxSetState(BLACKBOX_STATE_SEND_MAIN_FIELD_HEADER);
+                    // Only leave this state once the line is fully written; a
+                    // partial write is resumed on the next iteration.
+                    if (blackboxPrintfHeaderLine("I interval", "%d", blackboxIFrameInterval)) {
+                        blackboxSetState(BLACKBOX_STATE_SEND_MAIN_FIELD_HEADER);
+                    }
                 }
             }
         }

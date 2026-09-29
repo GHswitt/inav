@@ -60,6 +60,7 @@ extern int32_t blackboxHeaderBudget;
 
 void blackboxOpen(void);
 void blackboxWrite(uint8_t value);
+uint32_t blackboxWriteChunk(const uint8_t *buffer, uint32_t len);
 
 void blackboxDeviceFlush(void);
 bool blackboxDeviceFlushForce(void);
