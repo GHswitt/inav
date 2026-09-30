@@ -2006,6 +2006,11 @@ static bool blackboxWriteSysinfo(void)
 #endif
         BLACKBOX_PRINT_HEADER_LINE("acc_lpf_hz", "%d",                      accelerometerConfig()->acc_lpf_hz);
         BLACKBOX_PRINT_HEADER_LINE("acc_hardware", "%d",                    accelerometerConfig()->acc_hardware);
+        // Re-measured at every boot while disarmed (see navigation_pos_estimator.c), so it
+        // belongs with the flight, not with the config dump. Two fields to keep 0.01 cm/s^2
+        // of resolution without needing float formatting.
+        BLACKBOX_PRINT_HEADER_LINE("ins_gravity_cmss", "%d.%02d",           (int)gyroConfig()->gravity_cmss_cal,
+                                                                            (int)(gyroConfig()->gravity_cmss_cal * 100.0f) % 100);
 #ifdef USE_BARO
         BLACKBOX_PRINT_HEADER_LINE("baro_hardware", "%d",                   barometerConfig()->baro_hardware);
 #endif
